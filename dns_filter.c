@@ -2,7 +2,11 @@
  * DNS Filter - Сервис фильтрации DNS запросов
  * Маршрутизация DNS запросов на основе конфигурационных правил
  * С фильтрацией ответов по типам записей (множественные типы и исключения)
+ * Поддержка IPv4 и IPv6
  */
+
+#define _POSIX_C_SOURCE 200112L
+#define _DEFAULT_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +14,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -60,7 +65,7 @@ typedef struct {
 
 typedef struct {
     int socket;
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;  // Используем sockaddr_storage для IPv4/IPv6
     socklen_t client_addr_len;
     unsigned char buffer[BUFFER_SIZE];
     size_t buffer_len;
@@ -85,6 +90,22 @@ void debug_log(const char *fmt, ...) {
     vprintf(fmt, args);
     fflush(stdout);
     va_end(args);
+}
+
+// Преобразование адреса в строку (IPv4 или IPv6)
+const char* addr_to_string(struct sockaddr_storage *addr, char *buf, size_t buflen) {
+    void *addr_ptr;
+
+    if (addr->ss_family == AF_INET) {
+        addr_ptr = &((struct sockaddr_in*)addr)->sin_addr;
+    } else if (addr->ss_family == AF_INET6) {
+        addr_ptr = &((struct sockaddr_in6*)addr)->sin6_addr;
+    } else {
+        snprintf(buf, buflen, "unknown");
+        return buf;
+    }
+
+    return inet_ntop(addr->ss_family, addr_ptr, buf, buflen);
 }
 
 // Получить 16-битное значение из сетевого порядка байтов
@@ -343,28 +364,43 @@ int extract_domain(const unsigned char *buffer, size_t len, char *domain) {
 
 // Резолюция имени DNS сервера в IP
 char* resolve_server(const char *server) {
-    static char resolved_ip[16];
+    static char resolved_ip[INET6_ADDRSTRLEN];
 
-    // Проверка, является ли это уже IP адресом
-    struct in_addr test_addr;
-    if (inet_pton(AF_INET, server, &test_addr) == 1) {
+    // Проверка, является ли это уже IP адресом (IPv4)
+    struct in_addr test_addr4;
+    if (inet_pton(AF_INET, server, &test_addr4) == 1) {
         strcpy(resolved_ip, server);
         return resolved_ip;
     }
 
-    // Попытка резолюции по имени
-    struct hostent *he = gethostbyname(server);
-    if (he == NULL) {
-        debug_log("Failed to resolve %s\n", server);
-        return NULL;
+    // Проверка IPv6
+    struct in6_addr test_addr6;
+    if (inet_pton(AF_INET6, server, &test_addr6) == 1) {
+        strcpy(resolved_ip, server);
+        return resolved_ip;
     }
 
-    // Используем h_addr_list[0] вместо h_addr
-    struct in_addr *addr = (struct in_addr *)he->h_addr_list[0];
-    strcpy(resolved_ip, inet_ntoa(*addr));
-    debug_log("Resolved %s to %s\n", server, resolved_ip);
+    // Попытка резолюции по имени (предпочитаем IPv4)
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;  // Предпочитаем IPv4
+    hints.ai_socktype = SOCK_DGRAM;
 
-    return resolved_ip;
+    if (getaddrinfo(server, NULL, &hints, &res) == 0) {
+        if (res->ai_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in*)res->ai_addr)->sin_addr,
+                     resolved_ip, sizeof(resolved_ip));
+        } else if (res->ai_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6*)res->ai_addr)->sin6_addr,
+                     resolved_ip, sizeof(resolved_ip));
+        }
+        debug_log("Resolved %s to %s\n", server, resolved_ip);
+        freeaddrinfo(res);
+        return resolved_ip;
+    }
+
+    debug_log("Failed to resolve %s\n", server);
+    return NULL;
 }
 
 // Парсинг фильтра типов
@@ -585,17 +621,40 @@ int forward_query(const char *server_ip,
                   unsigned char *response, 
                   size_t *response_len) {
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    // Определяем тип адреса (IPv4 или IPv6)
+    struct sockaddr_storage server_addr;
+    socklen_t server_addr_len;
+    int af_family;
+
+    memset(&server_addr, 0, sizeof(server_addr));
+
+    // Пробуем IPv4
+    struct sockaddr_in *addr4 = (struct sockaddr_in*)&server_addr;
+    if (inet_pton(AF_INET, server_ip, &addr4->sin_addr) == 1) {
+        af_family = AF_INET;
+        addr4->sin_family = AF_INET;
+        addr4->sin_port = htons(53);
+        server_addr_len = sizeof(struct sockaddr_in);
+    } 
+    // Пробуем IPv6
+    else {
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6*)&server_addr;
+        if (inet_pton(AF_INET6, server_ip, &addr6->sin6_addr) == 1) {
+            af_family = AF_INET6;
+            addr6->sin6_family = AF_INET6;
+            addr6->sin6_port = htons(53);
+            server_addr_len = sizeof(struct sockaddr_in6);
+        } else {
+            fprintf(stderr, "Invalid server IP: %s\n", server_ip);
+            return -1;
+        }
+    }
+
+    int sock = socket(af_family, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket");
         return -1;
     }
-
-    struct sockaddr_in server;
-    memset(&server, 0, sizeof(server));
-    server.sin_family = AF_INET;
-    server.sin_port = htons(53);
-    inet_pton(AF_INET, server_ip, &server.sin_addr);
 
     struct timeval timeout;
     timeout.tv_sec = 3;
@@ -603,13 +662,13 @@ int forward_query(const char *server_ip,
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     if (sendto(sock, query, query_len, 0, 
-               (struct sockaddr *)&server, sizeof(server)) < 0) {
+               (struct sockaddr *)&server_addr, server_addr_len) < 0) {
         perror("sendto");
         close(sock);
         return -1;
     }
 
-    struct sockaddr_in from;
+    struct sockaddr_storage from;
     socklen_t from_len = sizeof(from);
 
     ssize_t n = recvfrom(sock, response, BUFFER_SIZE, 0, 
@@ -638,8 +697,11 @@ void* handle_query(void *arg) {
         return NULL;
     }
 
-    printf("Query for: %s\n", domain);
-    debug_log("Received query for domain: %s\n", domain);
+    char client_ip[INET6_ADDRSTRLEN];
+    addr_to_string(&ctx->client_addr, client_ip, sizeof(client_ip));
+
+    printf("Query for: %s from %s\n", domain, client_ip);
+    debug_log("Received query for domain: %s from %s\n", domain, client_ip);
 
     // Поиск подходящего правила
     DnsRule *matched_rule = NULL;
@@ -709,10 +771,53 @@ void* handle_query(void *arg) {
     return NULL;
 }
 
+// Создание и привязка сокета (IPv4 или IPv6)
+int create_and_bind_socket(int af_family) {
+    int sock = socket(af_family, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    if (af_family == AF_INET6) {
+        // Отключаем dual-stack (чтобы IPv6 сокет не принимал IPv4)
+        int v6only = 1;
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+    }
+
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+    memset(&addr, 0, sizeof(addr));
+
+    if (af_family == AF_INET) {
+        struct sockaddr_in *addr4 = (struct sockaddr_in*)&addr;
+        addr4->sin_family = AF_INET;
+        addr4->sin_addr.s_addr = htonl(INADDR_ANY);
+        addr4->sin_port = htons(DNS_PORT);
+        addr_len = sizeof(struct sockaddr_in);
+    } else {
+        struct sockaddr_in6 *addr6 = (struct sockaddr_in6*)&addr;
+        addr6->sin6_family = AF_INET6;
+        addr6->sin6_addr = in6addr_any;
+        addr6->sin6_port = htons(DNS_PORT);
+        addr_len = sizeof(struct sockaddr_in6);
+    }
+
+    if (bind(sock, (struct sockaddr *)&addr, addr_len) < 0) {
+        perror("bind");
+        close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
 // Основной цикл сервера
 int main(int argc, char *argv[]) {
-    int sock;
-    struct sockaddr_in addr, client_addr;
+    int sock4, sock6;
 
     // Игнорируем неиспользуемый argc
     (void)argc;
@@ -728,65 +833,107 @@ int main(int argc, char *argv[]) {
         g_config.default_server_count = 1;
     }
 
-    // Создание UDP сокета
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
+    // Создание IPv4 сокета
+    sock4 = create_and_bind_socket(AF_INET);
+    if (sock4 < 0) {
+        fprintf(stderr, "Failed to create IPv4 socket\n");
         return 1;
     }
+    printf("DNS Filter listening on 0.0.0.0:%d (IPv4)\n", DNS_PORT);
 
-    int reuse = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    // Привязка к порту 53
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(DNS_PORT);
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        return 1;
+    // Создание IPv6 сокета
+    sock6 = create_and_bind_socket(AF_INET6);
+    if (sock6 < 0) {
+        fprintf(stderr, "Warning: Failed to create IPv6 socket (IPv6 disabled)\n");
+        sock6 = -1;
+    } else {
+        printf("DNS Filter listening on [::]:%d (IPv6)\n", DNS_PORT);
     }
 
-    printf("DNS Filter listening on port %d\n", DNS_PORT);
     if (g_config.debug) {
         printf("Debug mode: ON\n");
     }
 
-    // Основной цикл
+    // Основной цикл с select()
+    fd_set readfds;
+    int maxfd = (sock6 > sock4) ? sock6 : sock4;
+
     while (1) {
-        QueryContext *ctx = malloc(sizeof(QueryContext));
-        if (!ctx) {
-            perror("malloc");
+        FD_ZERO(&readfds);
+        FD_SET(sock4, &readfds);
+        if (sock6 >= 0) {
+            FD_SET(sock6, &readfds);
+        }
+
+        int activity = select(maxfd + 1, &readfds, NULL, NULL, NULL);
+
+        if (activity < 0) {
+            perror("select");
             continue;
         }
 
-        ctx->socket = sock;
-        ctx->client_addr_len = sizeof(client_addr);
+        // Проверяем IPv4 сокет
+        if (FD_ISSET(sock4, &readfds)) {
+            QueryContext *ctx = malloc(sizeof(QueryContext));
+            if (!ctx) {
+                perror("malloc");
+                continue;
+            }
 
-        ssize_t n = recvfrom(sock, ctx->buffer, BUFFER_SIZE, 0,
-                            (struct sockaddr *)&client_addr, &ctx->client_addr_len);
+            ctx->socket = sock4;
+            ctx->client_addr_len = sizeof(ctx->client_addr);
 
-        if (n < 0) {
-            perror("recvfrom");
-            free(ctx);
-            continue;
+            ssize_t n = recvfrom(sock4, ctx->buffer, BUFFER_SIZE, 0,
+                                (struct sockaddr *)&ctx->client_addr, &ctx->client_addr_len);
+
+            if (n < 0) {
+                perror("recvfrom IPv4");
+                free(ctx);
+            } else {
+                ctx->buffer_len = n;
+
+                pthread_t thread;
+                if (pthread_create(&thread, NULL, handle_query, ctx) != 0) {
+                    perror("pthread_create");
+                    free(ctx);
+                } else {
+                    pthread_detach(thread);
+                }
+            }
         }
 
-        ctx->buffer_len = n;
-        ctx->client_addr = client_addr;
+        // Проверяем IPv6 сокет
+        if (sock6 >= 0 && FD_ISSET(sock6, &readfds)) {
+            QueryContext *ctx = malloc(sizeof(QueryContext));
+            if (!ctx) {
+                perror("malloc");
+                continue;
+            }
 
-        // Создание нового потока для обработки запроса
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, handle_query, ctx) != 0) {
-            perror("pthread_create");
-            free(ctx);
-            continue;
+            ctx->socket = sock6;
+            ctx->client_addr_len = sizeof(ctx->client_addr);
+
+            ssize_t n = recvfrom(sock6, ctx->buffer, BUFFER_SIZE, 0,
+                                (struct sockaddr *)&ctx->client_addr, &ctx->client_addr_len);
+
+            if (n < 0) {
+                perror("recvfrom IPv6");
+                free(ctx);
+            } else {
+                ctx->buffer_len = n;
+
+                pthread_t thread;
+                if (pthread_create(&thread, NULL, handle_query, ctx) != 0) {
+                    perror("pthread_create");
+                    free(ctx);
+                } else {
+                    pthread_detach(thread);
+                }
+            }
         }
-        pthread_detach(thread);
     }
 
-    close(sock);
+    close(sock4);
+    if (sock6 >= 0) close(sock6);
     return 0;
 }
