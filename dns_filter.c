@@ -1,8 +1,6 @@
 /*
  * DNS Filter - Сервис фильтрации DNS запросов
- * Маршрутизация DNS запросов на основе конфигурационных правил
- * С фильтрацией ответов по типам записей (множественные типы и исключения)
- * Поддержка IPv4 и IPv6
+ * Graceful shutdown с обработкой сигналов SIGINT, SIGTERM, SIGQUIT
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -22,12 +20,15 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
+#include <signal.h>
+#include <errno.h>
 
 #define MAX_RULES 100
 #define MAX_SERVERS 10
 #define DNS_PORT 53
 #define BUFFER_SIZE 512
 #define CONFIG_FILE "dns_filter.conf"
+#define SHUTDOWN_TIMEOUT 5
 
 // DNS типы записей
 #define DNS_TYPE_A      1
@@ -36,55 +37,73 @@
 #define DNS_TYPE_MX     15
 #define DNS_TYPE_AAAA   28
 
-// Структура для фильтра типов
+volatile sig_atomic_t shutdown_flag = 0;
+int sock4 = -1, sock6 = -1;
+
 typedef struct {
-    int ipv4;      // A
-    int ipv6;      // AAAA
-    int mx;        // MX
-    int ns;        // NS
-    int all;       // * (все)
-    int exclude;   // Режим исключения (! перед типом)
+    int ipv4, ipv6, mx, ns, all, exclude;
 } TypeFilter;
 
-// Структура для правила маршрутизации
 typedef struct {
-    char pattern[128];           // Шаблон домена
-    TypeFilter filter;          // Фильтр типов
-    char servers[MAX_SERVERS][256]; // DNS серверы
-    int server_count;           // Количество серверов
+    char pattern[128];
+    TypeFilter filter;
+    char servers[MAX_SERVERS][256];
+    int server_count;
 } DnsRule;
 
-// Структура конфигурации
 typedef struct {
     DnsRule rules[MAX_RULES];
     int rule_count;
     char default_servers[MAX_SERVERS][256];
     int default_server_count;
-    int debug;  // Флаг отладки
+    int debug;
 } DnsConfig;
 
 typedef struct {
     int socket;
-    struct sockaddr_storage client_addr;  // Используем sockaddr_storage для IPv4/IPv6
+    struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
     unsigned char buffer[BUFFER_SIZE];
     size_t buffer_len;
-    TypeFilter *filter;  // Фильтр для применения
+    TypeFilter *filter;
 } QueryContext;
 
 DnsConfig g_config;
 
-// Вспомогательные функции
+static void signal_handler(int sig) {
+    if (!shutdown_flag) {
+        printf("\nReceived signal %d. Initiating graceful shutdown...\n", sig);
+        fflush(stdout);
+        shutdown_flag = 1;
+    }
+}
+
+static void cleanup(void) {
+    printf("Shutting down DNS Filter...\n");
+
+    if (sock4 >= 0) {
+        close(sock4);
+        printf("IPv4 socket closed\n");
+    }
+
+    if (sock6 >= 0) {
+        close(sock6);
+        printf("IPv6 socket closed\n");
+    }
+
+    printf("DNS Filter stopped.\n");
+    fflush(stdout);
+}
 
 void debug_log(const char *fmt, ...) {
-    if (!g_config.debug) return;
+    if (!g_config.debug || shutdown_flag) return;
 
     va_list args;
     va_start(args, fmt);
     time_t now = time(NULL);
-    struct tm *tm_info = localtime(&now);
+    struct tm *tm = localtime(&now);
     char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm);
 
     printf("[%s] DEBUG: ", timestamp);
     vprintf(fmt, args);
@@ -92,7 +111,6 @@ void debug_log(const char *fmt, ...) {
     va_end(args);
 }
 
-// Преобразование адреса в строку (IPv4 или IPv6)
 const char* addr_to_string(struct sockaddr_storage *addr, char *buf, size_t buflen) {
     void *addr_ptr;
 
@@ -108,60 +126,35 @@ const char* addr_to_string(struct sockaddr_storage *addr, char *buf, size_t bufl
     return inet_ntop(addr->ss_family, addr_ptr, buf, buflen);
 }
 
-// Получить 16-битное значение из сетевого порядка байтов
 uint16_t get_uint16(const unsigned char *data) {
     return (data[0] << 8) | data[1];
 }
 
-// Установить 16-битное значение в сетевом порядке байтов
 void set_uint16(unsigned char *data, uint16_t value) {
     data[0] = (value >> 8) & 0xFF;
     data[1] = value & 0xFF;
 }
 
-// Проверка, нужна ли фильтрация
 int needs_filtering(TypeFilter *filter) {
-    if (!filter) return 0;
+    if (!filter || shutdown_flag) return 0;
     if (filter->all && !filter->exclude) return 0;
-    // Если установлен хотя бы один специфичный фильтр
-    if (filter->ipv4 || filter->ipv6 || filter->mx || filter->ns) return 1;
-    return 0;
+    return filter->ipv4 || filter->ipv6 || filter->mx || filter->ns;
 }
 
-// Проверка, должен ли тип записи быть отфильтрован
 int should_filter_type(TypeFilter *filter, uint16_t qtype) {
-    if (!filter || (filter->all && !filter->exclude)) return 0;  // Не фильтруем
+    if (!filter || shutdown_flag) return 0;
 
     int is_selected = 0;
-
     switch (qtype) {
-        case DNS_TYPE_A:
-            is_selected = filter->ipv4;
-            break;
-        case DNS_TYPE_AAAA:
-            is_selected = filter->ipv6;
-            break;
-        case DNS_TYPE_MX:
-            is_selected = filter->mx;
-            break;
-        case DNS_TYPE_NS:
-            is_selected = filter->ns;
-            break;
-        case DNS_TYPE_CNAME:
-            return 0;  // CNAME всегда оставляем
-        default:
-            is_selected = 0;
-            break;
+        case DNS_TYPE_A:    is_selected = filter->ipv4; break;
+        case DNS_TYPE_AAAA: is_selected = filter->ipv6; break;
+        case DNS_TYPE_MX:   is_selected = filter->mx;   break;
+        case DNS_TYPE_NS:   is_selected = filter->ns;   break;
+        case DNS_TYPE_CNAME: return 0;
+        default: return 0;
     }
 
-    // Если режим исключения - инвертируем логику
-    if (filter->exclude) {
-        // Исключаем если тип выбран
-        return is_selected;
-    } else {
-        // Фильтруем если тип НЕ выбран
-        return !is_selected;
-    }
+    return filter->exclude ? is_selected : !is_selected;
 }
 
 const char* type_to_string(uint16_t type) {
@@ -175,7 +168,6 @@ const char* type_to_string(uint16_t type) {
     }
 }
 
-// Пропустить DNS имя в пакете
 int skip_dns_name(const unsigned char *buffer, size_t len, size_t *pos) {
     while (*pos < len) {
         unsigned char label_len = buffer[*pos];
@@ -185,7 +177,6 @@ int skip_dns_name(const unsigned char *buffer, size_t len, size_t *pos) {
             return 0;
         }
 
-        // Проверка на сжатие (compression pointer)
         if ((label_len & 0xC0) == 0xC0) {
             (*pos) += 2;
             return 0;
@@ -194,78 +185,53 @@ int skip_dns_name(const unsigned char *buffer, size_t len, size_t *pos) {
         (*pos)++;
         *pos += label_len;
     }
-
     return -1;
 }
 
-// Фильтрация DNS ответа
 size_t filter_dns_response(unsigned char *response, size_t response_len, TypeFilter *filter) {
-    if (!needs_filtering(filter)) {
-        debug_log("No filtering needed\n");
-        return response_len;
-    }
+    if (!needs_filtering(filter)) return response_len;
 
-    if (response_len < 12) {
-        debug_log("Response too short for filtering\n");
-        return response_len;
-    }
+    if (response_len < 12) return response_len;
 
-    debug_log("Filter mode: %s, flags: ipv4=%d ipv6=%d mx=%d ns=%d all=%d\n",
-              filter->exclude ? "EXCLUDE" : "INCLUDE",
-              filter->ipv4, filter->ipv6, filter->mx, filter->ns, filter->all);
-
-    // Парсинг DNS заголовка
     uint16_t qdcount = get_uint16(response + 4);
     uint16_t ancount = get_uint16(response + 6);
-    uint16_t nscount = get_uint16(response + 8);
-    uint16_t arcount = get_uint16(response + 10);
 
-    debug_log("Original counts: QD=%d AN=%d NS=%d AR=%d\n", qdcount, ancount, nscount, arcount);
+    debug_log("Original AN=%d\n", ancount);
 
-    if (ancount == 0) {
-        debug_log("No answers to filter\n");
-        return response_len;
-    }
+    if (ancount == 0) return response_len;
 
-    // Пропускаем Question section
     size_t pos = 12;
     for (int i = 0; i < qdcount; i++) {
         if (skip_dns_name(response, response_len, &pos) < 0) return response_len;
-        pos += 4;  // QTYPE + QCLASS
+        pos += 4;
     }
 
-    // Создаём новый буфер для фильтрованного ответа
     unsigned char filtered[BUFFER_SIZE];
-    memcpy(filtered, response, pos);  // Копируем заголовок и questions
+    memcpy(filtered, response, pos);
 
     size_t write_pos = pos;
     uint16_t new_ancount = 0;
 
-    // Обрабатываем Answer section
     for (int i = 0; i < ancount && pos < response_len; i++) {
         size_t record_start = pos;
 
-        // Пропускаем имя
         if (skip_dns_name(response, response_len, &pos) < 0) break;
 
         if (pos + 10 > response_len) break;
 
-        // Читаем TYPE, CLASS, TTL, RDLENGTH
         uint16_t rtype = get_uint16(response + pos);
         uint16_t rdlength = get_uint16(response + pos + 8);
 
         size_t record_len = (pos - record_start) + 10 + rdlength;
 
-        // Проверяем фильтр
         if (should_filter_type(filter, rtype)) {
-            debug_log("  ✗ Filtering out %s record\n", type_to_string(rtype));
+            debug_log("  ✗ Filter %s\n", type_to_string(rtype));
             pos += 10 + rdlength;
             continue;
         }
 
-        debug_log("  ✓ Keeping %s record\n", type_to_string(rtype));
+        debug_log("  ✓ Keep %s\n", type_to_string(rtype));
 
-        // Копируем запись
         if (write_pos + record_len <= BUFFER_SIZE) {
             memcpy(filtered + write_pos, response + record_start, record_len);
             write_pos += record_len;
@@ -275,7 +241,6 @@ size_t filter_dns_response(unsigned char *response, size_t response_len, TypeFil
         pos += 10 + rdlength;
     }
 
-    // Копируем Authority и Additional sections как есть
     if (pos < response_len && write_pos < BUFFER_SIZE) {
         size_t remaining = response_len - pos;
         if (write_pos + remaining <= BUFFER_SIZE) {
@@ -284,59 +249,36 @@ size_t filter_dns_response(unsigned char *response, size_t response_len, TypeFil
         }
     }
 
-    // Обновляем счётчик ответов
     set_uint16(filtered + 6, new_ancount);
-
-    debug_log("Filtered result: AN=%d (was %d), size=%zu (was %zu)\n", 
-              new_ancount, ancount, write_pos, response_len);
-
-    // Копируем результат обратно
     memcpy(response, filtered, write_pos);
+
+    debug_log("Filtered AN=%d, size=%zu\n", new_ancount, write_pos);
     return write_pos;
 }
 
-// Проверка соответствия доменного имени шаблону
 int domain_matches(const char *domain, const char *pattern) {
-    char domain_lower[256];
-    char pattern_lower[256];
-    size_t i;
+    char domain_lower[256], pattern_lower[256];
 
-    // Преобразование в нижний регистр
-    for (i = 0; domain[i]; i++) {
-        domain_lower[i] = tolower(domain[i]);
-    }
+    for (size_t i = 0; domain[i]; i++) domain_lower[i] = tolower(domain[i]);
     domain_lower[strlen(domain)] = '\0';
 
-    for (i = 0; pattern[i]; i++) {
-        pattern_lower[i] = tolower(pattern[i]);
-    }
+    for (size_t i = 0; pattern[i]; i++) pattern_lower[i] = tolower(pattern[i]);
     pattern_lower[strlen(pattern)] = '\0';
 
-    // Обработка wildcards
-    if (strchr(pattern_lower, '*') == NULL) {
-        return strcmp(domain_lower, pattern_lower) == 0;
-    }
+    if (!strchr(pattern_lower, '*')) return strcmp(domain_lower, pattern_lower) == 0;
 
     char *star = strchr(pattern_lower, '*');
     size_t prefix_len = star - pattern_lower;
     size_t suffix_len = strlen(star + 1);
 
-    if (strlen(domain_lower) < prefix_len + suffix_len) {
-        return 0;
-    }
+    if (strlen(domain_lower) < prefix_len + suffix_len) return 0;
 
-    if (strncmp(domain_lower, pattern_lower, prefix_len) != 0) {
-        return 0;
-    }
-
-    if (strcmp(domain_lower + strlen(domain_lower) - suffix_len, star + 1) != 0) {
-        return 0;
-    }
+    if (strncmp(domain_lower, pattern_lower, prefix_len) != 0) return 0;
+    if (strcmp(domain_lower + strlen(domain_lower) - suffix_len, star + 1) != 0) return 0;
 
     return 1;
 }
 
-// Парсинг DNS пакета и извлечение доменного имени
 int extract_domain(const unsigned char *buffer, size_t len, char *domain) {
     if (len < 12) return -1;
 
@@ -351,7 +293,7 @@ int extract_domain(const unsigned char *buffer, size_t len, char *domain) {
             break;
         }
 
-        if (domain[0] != '\0') strcat(domain, ".");
+        if (domain[0]) strcat(domain, ".");
 
         for (int i = 0; i < len_byte && pos < len; i++, pos++) {
             char c = buffer[pos];
@@ -362,28 +304,24 @@ int extract_domain(const unsigned char *buffer, size_t len, char *domain) {
     return 0;
 }
 
-// Резолюция имени DNS сервера в IP
 char* resolve_server(const char *server) {
     static char resolved_ip[INET6_ADDRSTRLEN];
 
-    // Проверка, является ли это уже IP адресом (IPv4)
     struct in_addr test_addr4;
     if (inet_pton(AF_INET, server, &test_addr4) == 1) {
         strcpy(resolved_ip, server);
         return resolved_ip;
     }
 
-    // Проверка IPv6
     struct in6_addr test_addr6;
     if (inet_pton(AF_INET6, server, &test_addr6) == 1) {
         strcpy(resolved_ip, server);
         return resolved_ip;
     }
 
-    // Попытка резолюции по имени (предпочитаем IPv4)
     struct addrinfo hints, *res;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;  // Предпочитаем IPv4
+    hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
 
     if (getaddrinfo(server, NULL, &hints, &res) == 0) {
@@ -394,7 +332,7 @@ char* resolve_server(const char *server) {
             inet_ntop(AF_INET6, &((struct sockaddr_in6*)res->ai_addr)->sin6_addr,
                      resolved_ip, sizeof(resolved_ip));
         }
-        debug_log("Resolved %s to %s\n", server, resolved_ip);
+        debug_log("Resolved %s → %s\n", server, resolved_ip);
         freeaddrinfo(res);
         return resolved_ip;
     }
@@ -403,7 +341,6 @@ char* resolve_server(const char *server) {
     return NULL;
 }
 
-// Парсинг фильтра типов
 int parse_filter(char *filter_str, TypeFilter *filter) {
     memset(filter, 0, sizeof(TypeFilter));
 
@@ -411,62 +348,42 @@ int parse_filter(char *filter_str, TypeFilter *filter) {
     strncpy(filter_copy, filter_str, sizeof(filter_copy) - 1);
     filter_copy[sizeof(filter_copy) - 1] = '\0';
 
-    // Удаляем пробелы в начале и конце
     char *start = filter_copy;
     while (*start == ' ') start++;
-
     char *end = start + strlen(start) - 1;
-    while (end > start && *end == ' ') {
-        *end = '\0';
-        end--;
-    }
+    while (end > start && *end == ' ') *end-- = '\0';
 
-    // Проверяем на '*' (все типы)
     if (strcmp(start, "*") == 0) {
         filter->all = 1;
         return 0;
     }
 
-    // Парсим токены
-    int has_exclude = 0;
-    int has_include = 0;
+    int has_exclude = 0, has_include = 0;
 
     char *token = strtok(start, " ");
     while (token) {
         int is_exclude = 0;
 
-        // Проверяем на '!'
         if (token[0] == '!') {
             is_exclude = 1;
             has_exclude = 1;
-            token++; // Пропускаем '!'
+            token++;
         } else {
             has_include = 1;
         }
 
-        // Проверка на смешивание режимов
         if (has_exclude && has_include) {
-            fprintf(stderr, "ERROR: Cannot mix include and exclude filters\n");
+            fprintf(stderr, "ERROR: Cannot mix include/exclude filters\n");
             return -1;
         }
 
-        // Устанавливаем флаг исключения
-        if (is_exclude) {
-            filter->exclude = 1;
-        }
+        if (is_exclude) filter->exclude = 1;
 
-        // Парсим тип
-        if (strcmp(token, "ipv4") == 0) {
-            filter->ipv4 = 1;
-        } else if (strcmp(token, "ipv6") == 0) {
-            filter->ipv6 = 1;
-        } else if (strcmp(token, "mx") == 0) {
-            filter->mx = 1;
-        } else if (strcmp(token, "ns") == 0) {
-            filter->ns = 1;
-        } else {
-            fprintf(stderr, "WARNING: Unknown filter type: %s\n", token);
-        }
+        if (strcmp(token, "ipv4") == 0) filter->ipv4 = 1;
+        else if (strcmp(token, "ipv6") == 0) filter->ipv6 = 1;
+        else if (strcmp(token, "mx") == 0) filter->mx = 1;
+        else if (strcmp(token, "ns") == 0) filter->ns = 1;
+        else fprintf(stderr, "WARNING: Unknown filter: %s\n", token);
 
         token = strtok(NULL, " ");
     }
@@ -474,7 +391,6 @@ int parse_filter(char *filter_str, TypeFilter *filter) {
     return 0;
 }
 
-// Форматирование фильтра для вывода
 void format_filter(TypeFilter *filter, char *output, size_t output_size) {
     output[0] = '\0';
 
@@ -483,11 +399,8 @@ void format_filter(TypeFilter *filter, char *output, size_t output_size) {
         return;
     }
 
-    if (filter->exclude) {
-        strncat(output, "all EXCEPT: ", output_size - strlen(output) - 1);
-    } else {
-        strncat(output, "only: ", output_size - strlen(output) - 1);
-    }
+    if (filter->exclude) strncat(output, "all EXCEPT: ", output_size - strlen(output) - 1);
+    else strncat(output, "only: ", output_size - strlen(output) - 1);
 
     int first = 1;
     if (filter->ipv4) {
@@ -512,10 +425,9 @@ void format_filter(TypeFilter *filter, char *output, size_t output_size) {
     }
 }
 
-// Загрузка конфигурации из файла
 int load_config(const char *filename) {
     FILE *f = fopen(filename, "r");
-    if (f == NULL) {
+    if (!f) {
         perror("Cannot open config file");
         return -1;
     }
@@ -526,7 +438,6 @@ int load_config(const char *filename) {
     g_config.debug = 0;
 
     while (fgets(line, sizeof(line), f)) {
-        // Удаление пробелов и комментариев
         line[strcspn(line, "\n")] = 0;
         if (line[0] == '#' || line[0] == '\0') continue;
 
@@ -567,15 +478,11 @@ int load_config(const char *filename) {
             strncpy(rule->pattern, pattern, plen);
             rule->pattern[plen] = '\0';
 
-            // Удаление пробелов
-            while (plen > 0 && rule->pattern[plen-1] == ' ') 
-                rule->pattern[--plen] = '\0';
+            while (plen > 0 && rule->pattern[plen-1] == ' ') rule->pattern[--plen] = '\0';
 
-            // Парсинг фильтра типов
-            char *filter_str = arrow1 + 2;
             char filter_buf[256];
-            size_t filter_len = arrow2 - filter_str;
-            strncpy(filter_buf, filter_str, filter_len);
+            size_t filter_len = arrow2 - (arrow1 + 2);
+            strncpy(filter_buf, arrow1 + 2, filter_len);
             filter_buf[filter_len] = '\0';
 
             if (parse_filter(filter_buf, &rule->filter) < 0) {
@@ -583,12 +490,10 @@ int load_config(const char *filename) {
                 continue;
             }
 
-            // Форматируем фильтр для вывода
             char filter_desc[256];
             format_filter(&rule->filter, filter_desc, sizeof(filter_desc));
             printf("Rule '%s': %s\n", rule->pattern, filter_desc);
 
-            // Парсинг серверов
             char *servers = arrow2 + 2;
             while (*servers == ' ') servers++;
 
@@ -614,30 +519,22 @@ int load_config(const char *filename) {
     return 0;
 }
 
-// Отправка DNS запроса на upstream сервер
-int forward_query(const char *server_ip, 
-                  const unsigned char *query, 
-                  size_t query_len,
-                  unsigned char *response, 
-                  size_t *response_len) {
+int forward_query(const char *server_ip, const unsigned char *query, size_t query_len,
+                  unsigned char *response, size_t *response_len) {
 
-    // Определяем тип адреса (IPv4 или IPv6)
     struct sockaddr_storage server_addr;
     socklen_t server_addr_len;
     int af_family;
 
     memset(&server_addr, 0, sizeof(server_addr));
 
-    // Пробуем IPv4
     struct sockaddr_in *addr4 = (struct sockaddr_in*)&server_addr;
     if (inet_pton(AF_INET, server_ip, &addr4->sin_addr) == 1) {
         af_family = AF_INET;
         addr4->sin_family = AF_INET;
         addr4->sin_port = htons(53);
         server_addr_len = sizeof(struct sockaddr_in);
-    } 
-    // Пробуем IPv6
-    else {
+    } else {
         struct sockaddr_in6 *addr6 = (struct sockaddr_in6*)&server_addr;
         if (inet_pton(AF_INET6, server_ip, &addr6->sin6_addr) == 1) {
             af_family = AF_INET6;
@@ -661,8 +558,7 @@ int forward_query(const char *server_ip,
     timeout.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    if (sendto(sock, query, query_len, 0, 
-               (struct sockaddr *)&server_addr, server_addr_len) < 0) {
+    if (sendto(sock, query, query_len, 0, (struct sockaddr *)&server_addr, server_addr_len) < 0) {
         perror("sendto");
         close(sock);
         return -1;
@@ -671,8 +567,7 @@ int forward_query(const char *server_ip,
     struct sockaddr_storage from;
     socklen_t from_len = sizeof(from);
 
-    ssize_t n = recvfrom(sock, response, BUFFER_SIZE, 0, 
-                          (struct sockaddr *)&from, &from_len);
+    ssize_t n = recvfrom(sock, response, BUFFER_SIZE, 0, (struct sockaddr *)&from, &from_len);
 
     if (n < 0) {
         perror("recvfrom");
@@ -686,9 +581,13 @@ int forward_query(const char *server_ip,
     return 0;
 }
 
-// Обработка DNS запроса в отдельном потоке
 void* handle_query(void *arg) {
     QueryContext *ctx = (QueryContext *)arg;
+
+    if (shutdown_flag) {
+        free(ctx);
+        return NULL;
+    }
 
     char domain[256];
     if (extract_domain(ctx->buffer, ctx->buffer_len, domain) < 0) {
@@ -701,9 +600,7 @@ void* handle_query(void *arg) {
     addr_to_string(&ctx->client_addr, client_ip, sizeof(client_ip));
 
     printf("Query for: %s from %s\n", domain, client_ip);
-    debug_log("Received query for domain: %s from %s\n", domain, client_ip);
 
-    // Поиск подходящего правила
     DnsRule *matched_rule = NULL;
     for (int i = 0; i < g_config.rule_count; i++) {
         if (domain_matches(domain, g_config.rules[i].pattern)) {
@@ -713,7 +610,6 @@ void* handle_query(void *arg) {
         }
     }
 
-    // Выбор серверов и фильтра
     int server_count = 0;
     char (*servers)[256] = NULL;
     TypeFilter *filter = NULL;
@@ -722,68 +618,54 @@ void* handle_query(void *arg) {
         server_count = matched_rule->server_count;
         servers = matched_rule->servers;
         filter = &matched_rule->filter;
-        debug_log("Using %d servers from rule\n", server_count);
     } else {
         server_count = g_config.default_server_count;
         servers = g_config.default_servers;
-        filter = NULL;  // Нет фильтрации для default
-        debug_log("Using %d default servers\n", server_count);
+        filter = NULL;
     }
 
-    // Попытка отправить запрос на каждый сервер
     unsigned char response[BUFFER_SIZE];
     size_t response_len = 0;
     int success = 0;
 
-    for (int i = 0; i < server_count; i++) {
+    for (int i = 0; i < server_count && !shutdown_flag; i++) {
         char *server_ip = resolve_server(servers[i]);
 
-        if (server_ip == NULL) {
-            debug_log("Cannot resolve %s, trying next\n", servers[i]);
+        if (!server_ip) {
+            debug_log("Cannot resolve %s\n", servers[i]);
             continue;
         }
 
         debug_log("Forwarding to %s (%s)\n", servers[i], server_ip);
 
-        if (forward_query(server_ip, ctx->buffer, ctx->buffer_len, 
-                            response, &response_len) == 0) {
+        if (forward_query(server_ip, ctx->buffer, ctx->buffer_len, response, &response_len) == 0) {
             success = 1;
             break;
         }
     }
 
-    // Применяем фильтр к ответу
     if (success && needs_filtering(filter)) {
-        debug_log("Applying filter to response...\n");
+        debug_log("Applying filter...\n");
         response_len = filter_dns_response(response, response_len, filter);
     }
 
-    // Отправка ответа клиенту
-    if (success) {
+    if (success && !shutdown_flag) {
         sendto(ctx->socket, response, response_len, 0,
                (struct sockaddr *)&ctx->client_addr, ctx->client_addr_len);
-        debug_log("Response sent (%zu bytes)\n", response_len);
-    } else {
-        debug_log("All upstream servers failed\n");
     }
 
     free(ctx);
     return NULL;
 }
 
-// Создание и привязка сокета (IPv4 или IPv6)
 int create_and_bind_socket(int af_family) {
     int sock = socket(af_family, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return -1;
-    }
+    if (sock < 0) return -1;
 
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     if (af_family == AF_INET6) {
-        // Отключаем dual-stack (чтобы IPv6 сокет не принимал IPv4)
         int v6only = 1;
         setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
     }
@@ -807,7 +689,6 @@ int create_and_bind_socket(int af_family) {
     }
 
     if (bind(sock, (struct sockaddr *)&addr, addr_len) < 0) {
-        perror("bind");
         close(sock);
         return -1;
     }
@@ -815,25 +696,26 @@ int create_and_bind_socket(int af_family) {
     return sock;
 }
 
-// Основной цикл сервера
 int main(int argc, char *argv[]) {
-    int sock4, sock6;
+    (void)argc; (void)argv;
 
-    // Игнорируем неиспользуемый argc
-    (void)argc;
-    (void)argv;
+    sock4 = sock6 = -1;
 
-    // Инициализация конфигурации
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGQUIT, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    atexit(cleanup);
+
     memset(&g_config, 0, sizeof(g_config));
 
-    // Загрузка конфигурации
     if (load_config(CONFIG_FILE) < 0) {
         fprintf(stderr, "Using default configuration\n");
         strcpy(g_config.default_servers[0], "8.8.8.8");
         g_config.default_server_count = 1;
     }
 
-    // Создание IPv4 сокета
     sock4 = create_and_bind_socket(AF_INET);
     if (sock4 < 0) {
         fprintf(stderr, "Failed to create IPv4 socket\n");
@@ -841,44 +723,38 @@ int main(int argc, char *argv[]) {
     }
     printf("DNS Filter listening on 0.0.0.0:%d (IPv4)\n", DNS_PORT);
 
-    // Создание IPv6 сокета
     sock6 = create_and_bind_socket(AF_INET6);
     if (sock6 < 0) {
-        fprintf(stderr, "Warning: Failed to create IPv6 socket (IPv6 disabled)\n");
-        sock6 = -1;
+        fprintf(stderr, "Warning: IPv6 socket failed (IPv6 disabled)\n");
     } else {
         printf("DNS Filter listening on [::]:%d (IPv6)\n", DNS_PORT);
     }
 
-    if (g_config.debug) {
-        printf("Debug mode: ON\n");
-    }
+    if (g_config.debug) printf("Debug mode: ON\n");
 
-    // Основной цикл с select()
+    printf("Press Ctrl+C for graceful shutdown\n");
+
     fd_set readfds;
     int maxfd = (sock6 > sock4) ? sock6 : sock4;
 
-    while (1) {
+    while (!shutdown_flag) {
         FD_ZERO(&readfds);
         FD_SET(sock4, &readfds);
-        if (sock6 >= 0) {
-            FD_SET(sock6, &readfds);
-        }
+        if (sock6 >= 0) FD_SET(sock6, &readfds);
 
-        int activity = select(maxfd + 1, &readfds, NULL, NULL, NULL);
+        struct timeval timeout = {1, 0};
+
+        int activity = select(maxfd + 1, &readfds, NULL, NULL, &timeout);
 
         if (activity < 0) {
+            if (errno == EINTR) continue;
             perror("select");
             continue;
         }
 
-        // Проверяем IPv4 сокет
         if (FD_ISSET(sock4, &readfds)) {
             QueryContext *ctx = malloc(sizeof(QueryContext));
-            if (!ctx) {
-                perror("malloc");
-                continue;
-            }
+            if (!ctx) continue;
 
             ctx->socket = sock4;
             ctx->client_addr_len = sizeof(ctx->client_addr);
@@ -886,29 +762,23 @@ int main(int argc, char *argv[]) {
             ssize_t n = recvfrom(sock4, ctx->buffer, BUFFER_SIZE, 0,
                                 (struct sockaddr *)&ctx->client_addr, &ctx->client_addr_len);
 
-            if (n < 0) {
-                perror("recvfrom IPv4");
-                free(ctx);
-            } else {
+            if (n > 0) {
                 ctx->buffer_len = n;
 
                 pthread_t thread;
-                if (pthread_create(&thread, NULL, handle_query, ctx) != 0) {
-                    perror("pthread_create");
-                    free(ctx);
-                } else {
+                if (pthread_create(&thread, NULL, handle_query, ctx) == 0) {
                     pthread_detach(thread);
+                } else {
+                    free(ctx);
                 }
+            } else {
+                free(ctx);
             }
         }
 
-        // Проверяем IPv6 сокет
         if (sock6 >= 0 && FD_ISSET(sock6, &readfds)) {
             QueryContext *ctx = malloc(sizeof(QueryContext));
-            if (!ctx) {
-                perror("malloc");
-                continue;
-            }
+            if (!ctx) continue;
 
             ctx->socket = sock6;
             ctx->client_addr_len = sizeof(ctx->client_addr);
@@ -916,24 +786,28 @@ int main(int argc, char *argv[]) {
             ssize_t n = recvfrom(sock6, ctx->buffer, BUFFER_SIZE, 0,
                                 (struct sockaddr *)&ctx->client_addr, &ctx->client_addr_len);
 
-            if (n < 0) {
-                perror("recvfrom IPv6");
-                free(ctx);
-            } else {
+            if (n > 0) {
                 ctx->buffer_len = n;
 
                 pthread_t thread;
-                if (pthread_create(&thread, NULL, handle_query, ctx) != 0) {
-                    perror("pthread_create");
-                    free(ctx);
-                } else {
+                if (pthread_create(&thread, NULL, handle_query, ctx) == 0) {
                     pthread_detach(thread);
+                } else {
+                    free(ctx);
                 }
+            } else {
+                free(ctx);
             }
         }
     }
 
-    close(sock4);
-    if (sock6 >= 0) close(sock6);
+    printf("Waiting for active requests to complete (%ds timeout)...\n", SHUTDOWN_TIMEOUT);
+
+    time_t start_time = time(NULL);
+    while ((time(NULL) - start_time) < SHUTDOWN_TIMEOUT) {
+        usleep(100000);  // 0.1s
+    }
+
+    cleanup();
     return 0;
 }
