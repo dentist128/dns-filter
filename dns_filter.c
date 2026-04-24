@@ -265,18 +265,28 @@ int domain_matches(const char *domain, const char *pattern) {
     for (size_t i = 0; pattern[i]; i++) pattern_lower[i] = tolower(pattern[i]);
     pattern_lower[strlen(pattern)] = '\0';
 
-    if (!strchr(pattern_lower, '*')) return strcmp(domain_lower, pattern_lower) == 0;
+    const char *d = domain_lower;
+    const char *p = pattern_lower;
+    const char *star = NULL;
+    const char *match = d;
 
-    char *star = strchr(pattern_lower, '*');
-    size_t prefix_len = star - pattern_lower;
-    size_t suffix_len = strlen(star + 1);
+    while (*d) {
+        if (*p == '*') {
+            star = p++;
+            match = d;
+        } else if (*p == *d) {
+            p++;
+            d++;
+        } else if (star) {
+            p = star + 1;
+            d = ++match;
+        } else {
+            return 0;
+        }
+    }
 
-    if (strlen(domain_lower) < prefix_len + suffix_len) return 0;
-
-    if (strncmp(domain_lower, pattern_lower, prefix_len) != 0) return 0;
-    if (strcmp(domain_lower + strlen(domain_lower) - suffix_len, star + 1) != 0) return 0;
-
-    return 1;
+    while (*p == '*') p++;
+    return *p == '\0';
 }
 
 int extract_domain(const unsigned char *buffer, size_t len, char *domain) {
