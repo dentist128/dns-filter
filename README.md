@@ -262,12 +262,11 @@ the new tag — the same script pattern applies, replacing the tarball download 
 
 ### RouterOS troubleshooting
 
-* **Container exits immediately / cannot bind port 53** — RouterOS does not always
-  grant `CAP_NET_BIND_SERVICE` to non-root containers. Run as root inside the
-  container namespace (distroless has no shell, so this is reasonably safe):
-  ```rsc
-  /container/set [find name=dns-filter] user=0:0
-  ```
+* **Container exits with "Failed to create IPv4 socket: Permission denied"** —
+  the process could not bind UDP/53. The image runs as root for exactly this
+  reason (RouterOS does not grant `CAP_NET_BIND_SERVICE` to non-root
+  containers). If you overrode the user (`user=`), remove the override;
+  alternatively rebind clients to a translated port.
 * **First start is slow** — the image tarball is being extracted; watch the
   `extracting` flag in `/container/print`.
 * **Logs** — with `logging=yes` container stdout goes to the system log:

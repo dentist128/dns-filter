@@ -9,7 +9,11 @@ COPY Makefile dns_filter.conf dns_filter.c ./
 RUN make build
 
 FROM gcr.io/distroless/static-debian12:latest AS base
-USER 1000
+# Run as root: the RouterOS container runtime does not grant
+# CAP_NET_BIND_SERVICE to non-root containers, so a UID 1000 process
+# cannot bind UDP/53. Plain Docker users can still override with
+# `docker run --user 1000` (default capability set allows the bind).
+USER 0
 # Layout mirrors the systemd installation: binary in /usr/local/bin,
 # working directory /etc/dns-filter with dns_filter.conf next to it.
 # The config dir is the bind-mount point for RouterOS (dst=/etc/dns-filter).

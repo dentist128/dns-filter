@@ -728,7 +728,7 @@ int main(int argc, char *argv[]) {
 
     sock4 = create_and_bind_socket(AF_INET);
     if (sock4 < 0) {
-        fprintf(stderr, "Failed to create IPv4 socket\n");
+        fprintf(stderr, "Failed to create IPv4 socket: %s\n", strerror(errno));
         return 1;
     }
     printf("DNS Filter listening on 0.0.0.0:%d (IPv4)\n", DNS_PORT);

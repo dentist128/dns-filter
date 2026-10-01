@@ -30,7 +30,7 @@ make check-cap        # Verify CAP_NET_BIND_SERVICE is set on the binary
 - **Compiler**: `gcc` with `-Wall -Wextra -std=c99 -O2 -pthread -static`
 - **Single source file**: `dns_filter.c` → `bin/dns_filter`
 - **Static binary**: `-static` flag means the binary has no runtime dependencies
-- **Docker**: Multi-stage build — compiles in `debian:12`, copies static binary into `distroless/static-debian12`. Runs as UID 1000, exposes UDP/53. Layout mirrors the systemd install: binary at `/usr/local/bin/dns_filter`, `WORKDIR /etc/dns-filter` with `dns_filter.conf` in it. `/etc/dns-filter` is the bind-mount point for RouterOS (`/container/mounts ... dst=/etc/dns-filter`); on RouterOS the default config gets copied out to the router-side `src` dir on first start.
+- **Docker**: Multi-stage build — compiles in `debian:12`, copies static binary into `distroless/static-debian12`. Runs as **root (USER 0)** — required on RouterOS, whose container runtime does not grant `CAP_NET_BIND_SERVICE` to non-root containers (UID 1000 fails to bind UDP/53 with EACCES). Exposes UDP/53. Layout mirrors the systemd install: binary at `/usr/local/bin/dns_filter`, `WORKDIR /etc/dns-filter` with `dns_filter.conf` in it. `/etc/dns-filter` is the bind-mount point for RouterOS (`/container/mounts ... dst=/etc/dns-filter`); on RouterOS the default config gets copied out to the router-side `src` dir on first start.
 
 ## CI/CD (GitHub Actions)
 
