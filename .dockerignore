@@ -1,0 +1,12 @@
+# Keep the build context tiny: only Makefile, dns_filter.c and dns_filter.conf
+# are COPYed into the image (see Dockerfile).
+.git
+.github
+bin/
+*.tar
+*.tar.sha256
+*.md
+dns_filter.conf.local
+dns_filter.gw.conf
+dns-filter.service
+dns_filter_debug.conf

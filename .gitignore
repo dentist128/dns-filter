@@ -1,2 +1,5 @@
 bin
 *.service
+*.tar
+*.tar.sha256
+dns_filter_debug.conf

@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write   # create GitHub Release + push CHANGELOG.md
+  packages: write   # push image to GHCR
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  release:
+    # Native ARM64 runner (free for public repos) — the image and the
+    # RouterOS tarball are built for linux/arm64 without emulation.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for the changelog
+
+      - name: Resolve image tags
+        id: vars
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR_MINOR="$(echo "$VERSION" | cut -d. -f1,2)"
+          {
+            echo "version=$VERSION"
+            echo "major_minor=$MAJOR_MINOR"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Build and push image
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          MAJOR_MINOR: ${{ steps.vars.outputs.major_minor }}
+        run: |
+          docker build \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:$MAJOR_MINOR" \
+            -t "$IMAGE:latest" .
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:$MAJOR_MINOR"
+          docker push "$IMAGE:latest"
+
+      - name: Export RouterOS tarball and release assets
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          docker save "$IMAGE:$VERSION" -o dns-filter-arm64.tar
+          sha256sum dns-filter-arm64.tar > dns-filter-arm64.tar.sha256
+          # Plain version marker for the RouterOS auto-update script
+          printf '%s' "${GITHUB_REF_NAME}" > version.txt
+          ls -lh dns-filter-arm64.tar*
+
+      - name: Generate changelog
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          RANGE="${PREV:+$PREV..}$TAG"
+          COMPARE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV:-${TAG}}...${TAG}"
+
+          {
+            echo "## What's Changed"
+            echo
+            git log --no-merges --pretty=format:'* %s (%h)' "$RANGE"
+            echo
+            echo
+            echo "**Full changelog**: $COMPARE_URL"
+            echo
+            echo "### Assets"
+            echo
+            echo '* `dns-filter-arm64.tar` — image for RouterOS (`/container add file=...`)'
+            echo '* `dns-filter-arm64.tar.sha256` — checksum'
+            echo '* `version.txt` — version marker used by the auto-update script'
+          } > release_notes.md
+
+          {
+            echo "## [${TAG}] - $(date +%F)"
+            echo
+            git log --no-merges --pretty=format:'* %s (%h)' "$RANGE"
+            echo
+          } > changelog_section.md
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release_notes.md \
+            dns-filter-arm64.tar dns-filter-arm64.tar.sha256 version.txt
+
+      - name: Update CHANGELOG.md
+        env:
+          BRANCH: ${{ github.event.repository.default_branch || 'master' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$BRANCH"
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+          if [ ! -f CHANGELOG.md ]; then printf '# Changelog\n' > CHANGELOG.md; fi
+          TMP="$(mktemp)"
+          head -n 1 CHANGELOG.md > "$TMP"   # keep the '# Changelog' header
+          echo >> "$TMP"
+          cat changelog_section.md >> "$TMP"
+          echo >> "$TMP"
+          tail -n +2 CHANGELOG.md >> "$TMP"
+          mv "$TMP" CHANGELOG.md
+          git add CHANGELOG.md
+          git commit -m "docs: update CHANGELOG.md for ${GITHUB_REF_NAME} [skip ci]" \
+            || { echo "CHANGELOG.md is up to date, nothing to commit"; exit 0; }
+          git push origin "$BRANCH" \
+            || echo "::warning::Could not push CHANGELOG.md (release itself is unaffected)"

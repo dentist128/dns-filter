@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & smoke test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest        # linux/amd64, native
+          - os: ubuntu-24.04-arm     # linux/arm64, native (free for public repos)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile (gcc -Wall -Wextra)
+        run: make build
+
+      - name: Build container image
+        run: docker build -t dns-filter:ci .
+
+      - name: Smoke test (container starts and answers DNS)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils
+          docker run -d --name dns-filter-test -p 1053:53/udp dns-filter:ci
+          ok=0
+          for i in $(seq 1 15); do
+            if dig @127.0.0.1 -p 1053 example.com +time=2 +tries=1 +short | grep -q .; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then
+            docker logs dns-filter-test || true
+            echo "::error::Container did not answer a DNS query"
+            exit 1
+          fi
+          echo "Container answered a DNS query"
+
+      - name: Push edge image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          IMAGE="ghcr.io/${{ github.repository }}"
+          docker tag dns-filter:ci "$IMAGE:master"
+          docker push "$IMAGE:master"
