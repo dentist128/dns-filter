@@ -1,5 +1,12 @@
 # Changelog
 
+## [v1.0.1] - 2026-10-01
+
+* Add buildx builder setup for multi-platform builds (a253aab)
+* Fix architecture mismatch (0625c11)
+* docs: update CHANGELOG.md for v1.0.0 [skip ci] (a39cdea)
+
+
 ## [v1.0.0] - 2026-10-01
 
 * Add CI/CD and RouterOS container support (7c639d2)
