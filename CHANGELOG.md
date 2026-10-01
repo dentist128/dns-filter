@@ -1,5 +1,11 @@
 # Changelog
 
+## [v1.0.2] - 2026-10-01
+
+* Run as root in container (RouterOS lacks CAP_NET_BIND_SERVICE for non-root) (118d297)
+* docs: update CHANGELOG.md for v1.0.1 [skip ci] (0365b72)
+
+
 ## [v1.0.1] - 2026-10-01
 
 * Add buildx builder setup for multi-platform builds (a253aab)
