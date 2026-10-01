@@ -12,50 +12,89 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # Push multi-arch manifest lists (amd64, arm64, armv7) for all release tags.
+  # RouterOS resolves the list automatically, same as it does for docker.io images.
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Login to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      - name: Push multi-arch images
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR_MINOR="$(echo "$VERSION" | cut -d. -f1,2)"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64,linux/arm/v7 \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:$MAJOR_MINOR" \
+            -t "$IMAGE:latest" \
+            --push .
+
+  # Export per-architecture tarballs for /container add file=... on RouterOS.
+  tarballs:
+    name: Export tarball (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+            platform: linux/amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+          - os: ubuntu-latest
+            arch: armv7
+            platform: linux/arm/v7
+            qemu: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build image
+        run: docker buildx build --platform ${{ matrix.platform }} -t dns-filter:${{ matrix.arch }} --load .
+
+      - name: Export tarball
+        run: |
+          docker save "dns-filter:${{ matrix.arch }}" -o "dns-filter-${{ matrix.arch }}.tar"
+          sha256sum "dns-filter-${{ matrix.arch }}.tar" > "dns-filter-${{ matrix.arch }}.tar.sha256"
+          ls -lh "dns-filter-${{ matrix.arch }}.tar"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.arch }}
+          path: dns-filter-${{ matrix.arch }}.tar*
+          if-no-files-found: error
+
   release:
-    # Native ARM64 runner (free for public repos) — the image and the
-    # RouterOS tarball are built for linux/arm64 without emulation.
-    runs-on: ubuntu-24.04-arm
+    needs: [images, tarballs]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history for the changelog
 
-      - name: Resolve image tags
-        id: vars
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          MAJOR_MINOR="$(echo "$VERSION" | cut -d. -f1,2)"
-          {
-            echo "version=$VERSION"
-            echo "major_minor=$MAJOR_MINOR"
-          } >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          merge-multiple: true
+          path: dist
 
-      - name: Login to GHCR
-        run: echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-
-      - name: Build and push image
-        env:
-          VERSION: ${{ steps.vars.outputs.version }}
-          MAJOR_MINOR: ${{ steps.vars.outputs.major_minor }}
+      - name: Generate release assets
         run: |
-          docker build \
-            -t "$IMAGE:$VERSION" \
-            -t "$IMAGE:$MAJOR_MINOR" \
-            -t "$IMAGE:latest" .
-          docker push "$IMAGE:$VERSION"
-          docker push "$IMAGE:$MAJOR_MINOR"
-          docker push "$IMAGE:latest"
-
-      - name: Export RouterOS tarball and release assets
-        env:
-          VERSION: ${{ steps.vars.outputs.version }}
-        run: |
-          docker save "$IMAGE:$VERSION" -o dns-filter-arm64.tar
-          sha256sum dns-filter-arm64.tar > dns-filter-arm64.tar.sha256
           # Plain version marker for the RouterOS auto-update script
           printf '%s' "${GITHUB_REF_NAME}" > version.txt
-          ls -lh dns-filter-arm64.tar*
+          ls -lh dist/
 
       - name: Generate changelog
         run: |
@@ -74,8 +113,9 @@ jobs:
             echo
             echo "### Assets"
             echo
-            echo '* `dns-filter-arm64.tar` — image for RouterOS (`/container add file=...`)'
-            echo '* `dns-filter-arm64.tar.sha256` — checksum'
+            echo '* `dns-filter-armv7.tar` — image for 32-bit ARM devices (RB4011, hAP ac²/ac³, CRS3xx…)'
+            echo '* `dns-filter-arm64.tar` — image for ARM64 devices (hAP ax³, RB5009…)'
+            echo '* `dns-filter-amd64.tar` — image for x86_64 (CHR)'
             echo '* `version.txt` — version marker used by the auto-update script'
           } > release_notes.md
 
@@ -94,7 +134,10 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             --title "${GITHUB_REF_NAME}" \
             --notes-file release_notes.md \
-            dns-filter-arm64.tar dns-filter-arm64.tar.sha256 version.txt
+            dist/dns-filter-armv7.tar dist/dns-filter-armv7.tar.sha256 \
+            dist/dns-filter-arm64.tar dist/dns-filter-arm64.tar.sha256 \
+            dist/dns-filter-amd64.tar dist/dns-filter-amd64.tar.sha256 \
+            version.txt
 
       - name: Update CHANGELOG.md
         env:

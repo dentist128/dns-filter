@@ -15,29 +15,44 @@ concurrency:
 
 jobs:
   build:
-    name: Build & smoke test (${{ matrix.os }})
+    name: Build & smoke test (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest        # linux/amd64, native
-          - os: ubuntu-24.04-arm     # linux/arm64, native (free for public repos)
+          # amd64/arm64 run natively (arm64 runners are free for public repos);
+          # armv7 (32-bit MikroTik devices) is cross-built with QEMU.
+          - os: ubuntu-latest
+            arch: amd64
+            platform: linux/amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+          - os: ubuntu-latest
+            arch: armv7
+            platform: linux/arm/v7
+            qemu: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        if: matrix.qemu
+        uses: docker/setup-qemu-action@v3
+
       - name: Compile (gcc -Wall -Wextra)
+        if: ${{ !matrix.qemu }}
         run: make build
 
       - name: Build container image
-        run: docker build -t dns-filter:ci .
+        run: docker buildx build --platform ${{ matrix.platform }} -t dns-filter:ci --load .
 
       - name: Smoke test (container starts and answers DNS)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils
           docker run -d --name dns-filter-test -p 1053:53/udp dns-filter:ci
           ok=0
-          for i in $(seq 1 15); do
+          for i in $(seq 1 20); do
             if dig @127.0.0.1 -p 1053 example.com +time=2 +tries=1 +short | grep -q .; then
               ok=1
               break
@@ -56,5 +71,5 @@ jobs:
         run: |
           echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
           IMAGE="ghcr.io/${{ github.repository }}"
-          docker tag dns-filter:ci "$IMAGE:master"
-          docker push "$IMAGE:master"
+          docker tag dns-filter:ci "$IMAGE:master-${{ matrix.arch }}"
+          docker push "$IMAGE:master-${{ matrix.arch }}"

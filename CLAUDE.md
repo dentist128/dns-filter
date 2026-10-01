@@ -34,9 +34,13 @@ make check-cap        # Verify CAP_NET_BIND_SERVICE is set on the binary
 
 ## CI/CD (GitHub Actions)
 
-- `ci.yml` — matrix over native amd64 (`ubuntu-latest`) and arm64 (`ubuntu-24.04-arm`, free for public repos): `make build` + `docker build` + dig smoke test; pushes `:master` edge image to GHCR on pushes to master.
-- `release.yml` — triggered by pushing a `v*.*.*` tag. On a native ARM64 runner: pushes `X.Y.Z`/`X.Y`/`latest` to `ghcr.io/dentist128/dns-filter`, exports `dns-filter-arm64.tar` + `.sha256` + `version.txt`, generates release notes from git log since the previous tag, creates the GitHub Release, and commits an updated `CHANGELOG.md` back to the default branch (`[skip ci]` marker).
+- `ci.yml` — matrix over three architectures: amd64 and arm64 natively (`ubuntu-latest`, `ubuntu-24.04-arm` — ARM runners are free for public repos), armv7 via QEMU emulation. Each job: `make build` (native jobs) + `docker buildx build --platform …` + dig smoke test; pushes `:master-<arch>` edge images to GHCR on pushes to master.
+- `release.yml` — triggered by pushing a `v*.*.*` tag. Three jobs:
+  - `images` — one multi-arch `buildx --push` (amd64+arm64+arm/v7) publishing `X.Y.Z`/`X.Y`/`latest` manifest lists to `ghcr.io/dentist128/dns-filter` (RouterOS resolves the manifest per device, like docker.io).
+  - `tarballs` — per-arch `docker save` exports: `dns-filter-armv7.tar`, `dns-filter-arm64.tar`, `dns-filter-amd64.tar` (+ `.sha256`), uploaded as artifacts.
+  - `release` — changelog from git log since the previous tag, GitHub Release with all tarballs + `version.txt`, and commits an updated `CHANGELOG.md` back to the default branch (`[skip ci]` marker).
 - Release flow: `git tag v1.2.3 && git push origin v1.2.3`.
+- Target device is **armv7** (32-bit ARM MikroTik) — the README scripts use `dns-filter-armv7.tar`.
 - RouterOS-side update scripts live in README.md ("Automatic updates") — they compare `version.txt` from the latest release against the container's `comment` field.
 
 ## Architecture

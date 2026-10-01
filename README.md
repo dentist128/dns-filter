@@ -65,16 +65,25 @@ make build
 
 ## Running on MikroTik RouterOS (Container)
 
-DNS Filter ships as a distroless ARM64 container image (~10 MB) that runs natively on
-MikroTik devices with RouterOS 7.20+ (hAP ax³, RB5009, CCR2116, etc.).
+DNS Filter ships as a small distroless container image (~4 MB) that runs natively on
+MikroTik devices with RouterOS 7.20+. The image is built for three architectures:
+
+| Architecture | Devices | Release asset |
+|---|---|---|
+| `arm` (armv7, 32-bit) | RB4011, hAP ac², hAP ac³, CRS3xx | `dns-filter-armv7.tar` |
+| `arm64` | hAP ax³, RB5009, CCR2116 | `dns-filter-arm64.tar` |
+| `x86_64` | CHR | `dns-filter-amd64.tar` |
+
+Check yours with `:put [/system/resource/get cpu-architecture]` (examples below use
+`armv7` — substitute your architecture).
 
 Prebuilt artifacts published by CI:
-* `dns-filter-arm64.tar` — image tarball attached to every [release](https://github.com/dentist128/dns-filter/releases)
-* `ghcr.io/dentist128/dns-filter` — image in GitHub Container Registry
+* `dns-filter-<arch>.tar` — image tarballs attached to every [release](https://github.com/dentist128/dns-filter/releases)
+* `ghcr.io/dentist128/dns-filter` — multi-arch image in GitHub Container Registry
 
 ### Prerequisites
 
-1. ARM64 device with RouterOS 7.20+
+1. MikroTik device with RouterOS 7.20+ on `arm`, `arm64` or `x86_64` architecture
 2. The `container` extra package — download it for your exact RouterOS version from
    [mikrotik.com/download](https://mikrotik.com/download) ("Extra packages") and upload it to the router
 3. External storage recommended (examples below use `disk1`; adjust to your layout)
@@ -128,11 +137,13 @@ across container updates (see below).
 **Option A — tarball from GitHub Releases (recommended, no registry auth):**
 
 ```rsc
-/tool/fetch url=https://github.com/dentist128/dns-filter/releases/latest/download/dns-filter-arm64.tar dst-path=disk1/dns-filter/
-/container/add name=dns-filter file=disk1/dns-filter/dns-filter-arm64.tar interface=veth1 root-dir=disk1/dns-filter/image mounts=MOUNT_DNSFILTER start-on-boot=yes logging=yes
+/tool/fetch url=https://github.com/dentist128/dns-filter/releases/latest/download/dns-filter-armv7.tar dst-path=disk1/dns-filter/
+/container/add name=dns-filter file=disk1/dns-filter/dns-filter-armv7.tar interface=veth1 root-dir=disk1/dns-filter/image mounts=MOUNT_DNSFILTER start-on-boot=yes logging=yes
 ```
 
-**Option B — pull from GHCR:**
+(For an ARM64 device use `dns-filter-arm64.tar`, for CHR — `dns-filter-amd64.tar`.)
+
+**Option B — pull from GHCR (multi-arch manifest, RouterOS picks the right architecture):**
 
 ```rsc
 /container/config/set registry-url=https://ghcr.io tmpdir=disk1/tmp
@@ -218,12 +229,12 @@ field) and only redownloads when a new release is out:
 
     :if ($new != $cur) do={
         :log info "dns-filter: updating $cur -> $new"
-        /tool/fetch url="https://github.com/$repo/releases/latest/download/dns-filter-arm64.tar" dst-path="$dir/dns-filter-arm64.tar"
+        /tool/fetch url="https://github.com/$repo/releases/latest/download/dns-filter-armv7.tar" dst-path="$dir/dns-filter-armv7.tar"
         /container/stop $name
         :while ([/container/print/count-only where name=$name stopping]) do={:delay 1s}
         /container/remove $name
         :delay 5s
-        /container/add name=$name file="$dir/dns-filter-arm64.tar" interface=veth1 \
+        /container/add name=$name file="$dir/dns-filter-armv7.tar" interface=veth1 \
             root-dir="$dir/image" mounts=MOUNT_DNSFILTER start-on-boot=yes logging=yes comment=$new
         :while ([/container/print/count-only where name=$name extracting]) do={:delay 2s}
         /container/start $name
@@ -263,6 +274,11 @@ the new tag — the same script pattern applies, replacing the tarball download 
   `/log/print where topics~"container"`.
 * **`repull` leaves stray files in the root dir** — known cosmetic 7.20.x bug,
   harmless.
+* **`import error: fetch config failed: architecture mismatch`** — the image
+  architecture does not match the device. Check the device architecture with
+  `:put [/system/resource/get cpu-architecture]` and use the matching tarball
+  (`armv7` / `arm64` / `amd64`). For GHCR pulls this should not happen — the
+  multi-arch manifest resolves per device.
 * **Truncated DNS answers** — the proxy handles UDP payloads up to 512 bytes only
   (no EDNS0/TCP); this is a proxy limitation, not a RouterOS issue.
 
