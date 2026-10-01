@@ -40,6 +40,9 @@ jobs:
         if: matrix.qemu
         uses: docker/setup-qemu-action@v3
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Compile (gcc -Wall -Wextra)
         if: ${{ !matrix.qemu }}
         run: make build
